@@ -1,0 +1,69 @@
+# Neuroscience Research Data Pipeline
+
+A dynamic data center built from global scientific literature on neurosciences. This infrastructure is not static; it is designed to continuously adapt, scale, and ingest new research. The current configuration represents only the baseline foundation, engineered to expand as the field evolves.
+
+## Directory Structure
+
+```text
+research-neurosciences/
+├── README.md                 # Project documentation
+├── core/                     # Ingestion, processing and worker scripts
+│   ├── ingest.py             # Base ingestion engine (Phase 1)
+│   ├── ingest_blocks.py      # Multi-block neuroscience pipeline (Phase 2)
+│   └── purge_worker.py       # Automated server storage cleaner
+└── storage/                  # Multi-tier data lake
+    ├── 1_raw_data/           # Temporary landing zone for heavy binary files (PDFs)
+    ├── 2_register_data/      # Immutable entry point (master_registry.csv)
+    └── 3_exploitable_data/   # Clean normalized text inputs (Markdown)
+```
+
+## Data Lifecycle & State Matrix
+
+To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across three unified states inside master_registry.csv:
+
+**Ingestion (1_raw_data):** System fetches the source file.
+`status_retrieved = Success | status_processed = Pending | status_raw = Present`
+
+**Transformation (3_exploitable_data):** Workers extract clean text chunks into Markdown.
+`status_retrieved = Success | status_processed = Terminated | status_raw = Present`
+
+**Purge (purge_worker):** Frees up disk space once file integrity is validated.
+`status_retrieved = Success | status_processed = Terminated | status_raw = Purged`
+
+Note: If a paper sits behind an impenetrable paywall, status_retrieved switches to Failure. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written.
+
+## How to Run
+
+### Data Retrieval
+
+The retrieval layer is designed to be expandable: `ingest.py` and `ingest_blocks.py` are only the first two scripts in what is meant to become a growing library of ingestion pipelines. Additional blocks, domains, and sources can be added over time without breaking the existing registry structure, since deduplication is handled automatically across all scripts via DOIs and normalized titles.
+
+**1. Run Base Ingestion (Phase 1)**
+
+Collects the core baseline dataset directly from the master OpenAlex query. This is the foundational script all subsequent ingestion pipelines build on top of:
+
+```bash
+python3 core/ingest.py
+```
+
+**2. Run Multi-Block Expansion (Phase 2)**
+
+Scans 11 specific neuroscience and hardware domains as a first extension of the base ingestion engine. This script is intended as a template: future blocks covering new domains or sources can be added following the same pattern:
+
+```bash
+python3 core/ingest_blocks.py
+```
+
+### Storage Cleanup
+
+Once data has been retrieved and transformed, the storage layer can be cleaned to keep server usage under control.
+
+**3. Clear Server Storage**
+
+Safely purges downloaded PDFs whose content has already been compiled into verified, ultra-light Markdown files. This step only runs once file integrity has been validated against the registry, ensuring no data is lost in the process:
+
+```bash
+python3 core/purge_worker.py
+```
+
+NOTE : this script can be reused for other reasearch folder, it might need some tweaks to match the data.

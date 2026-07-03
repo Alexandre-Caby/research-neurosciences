@@ -1,0 +1,4 @@
+Here will be all data :
+- 1_raw_data : full data obtained by the executioners
+- 2_register_data : central register of all data being retrieved (CANNOT BE DELETED)
+- 3_exploitable_data : Cleaned data to be used. The central register can be added on support if needed
