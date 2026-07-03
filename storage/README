@@ -1,4 +1,10 @@
-Here will be all data :
-- 1_raw_data : full data obtained by the executioners
-- 2_register_data : central register of all data being retrieved (CANNOT BE DELETED)
-- 3_exploitable_data : Cleaned data to be used. The central register can be added on support if needed
+# Multi-Tier Data Lake
+
+This directory houses all data assets partitioned into three strict logical tiers based on their processing maturity.
+
+## Storage Tiers
+
+- **`1_raw_data/` (Bronze Tier)**: Temporary landing zone for heavy binary files (e.g., source PDFs). Content here is highly volatile and subject to automated purges.
+- **`2_register_data/` (Silver Tier)**: Central immutable ledger tracking global system states (`_registry.csv`). 
+  - **CRITICAL RULE**: This folder and its contents **CANNOT** be deleted or manually altered. It acts as the single source of truth for deduplication.
+- **`3_exploitable_data/` (Gold Tier)**: Normalized, structured, and ultra-light text assets (Markdown/JSON) optimized for direct agent exploitation.

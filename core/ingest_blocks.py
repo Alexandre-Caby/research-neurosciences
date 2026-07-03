@@ -11,9 +11,15 @@ import pandas as pd
 API_KEY = "4NtO7zxUXCf2Z0mWwEErr4"
 EMAIL_CONTACT = "alexandre.caby@sncf.fr"
 
+# Dynamically resolve root project folder name
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../storage"))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+ROOT_NAME = os.path.basename(ROOT_DIR)
+# Extract suffix (e.g., 'research-neurosciences' -> 'neurosciences')
+TOPIC = ROOT_NAME.replace("research-", "") if "research-" in ROOT_NAME else ROOT_NAME
 
+# Standard Server Storage Path Mapping
+STORAGE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../storage"))
 RAW_DIR = os.path.join(STORAGE_DIR, "1_raw_data")
 REG_DIR = os.path.join(STORAGE_DIR, "2_register_data")
 EXP_DIR = os.path.join(STORAGE_DIR, "3_exploitable_data")
@@ -21,7 +27,8 @@ EXP_DIR = os.path.join(STORAGE_DIR, "3_exploitable_data")
 for folder in [RAW_DIR, REG_DIR, EXP_DIR]:
     os.makedirs(folder, exist_ok=True)
 
-REGISTRY_FILE = os.path.join(REG_DIR, "master_registry.csv")
+# Automated Dynamic Naming Execution
+REGISTRY_FILE = os.path.join(REG_DIR, f"{TOPIC}_registry.csv")
 MAX_PAGES_PER_BLOCK = 5
 
 KEYWORDS_BLOCKS = {

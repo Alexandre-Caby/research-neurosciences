@@ -5,32 +5,44 @@ A dynamic data center built from global scientific literature on neurosciences. 
 ## Directory Structure
 
 ```text
-research-neurosciences/
+research-<topic>/
 ├── README.md                 # Project documentation
 ├── core/                     # Ingestion, processing and worker scripts
+│   ├── README.md             # Core execution engine documentation
 │   ├── ingest.py             # Base ingestion engine (Phase 1)
-│   ├── ingest_blocks.py      # Multi-block neuroscience pipeline (Phase 2)
-│   └── purge_worker.py       # Automated server storage cleaner
+│   ├── ingest_blocks.py      # Multi-block domain pipeline (Phase 2)
+│   ├── purge_worker.py       # Automated server storage cleaner
+│   ├── clean_worker_fitz.py  # Lightweight CPU text extraction worker
+│   └── clean_worker_marker.py# Vision Model text extraction worker
 └── storage/                  # Multi-tier data lake
+    ├── README.md             # Data lake storage tiers documentation
     ├── 1_raw_data/           # Temporary landing zone for heavy binary files (PDFs)
-    ├── 2_register_data/      # Immutable entry point (master_registry.csv)
+    ├── 2_register_data/      # Immutable entry point (<topic>_registry.csv)
     └── 3_exploitable_data/   # Clean normalized text inputs (Markdown)
 ```
 
+## Naming & Directory Conventions
+
+To remain fully modular and deployment-agnostic across different research vectors, the system enforces strict geometric naming conventions:
+
+- **Root Directory Rule**: The root directory must follow the pattern `research-xxx` (e.g., `research-neurosciences`, `research-genetics`).
+- **Dynamic Registry Mapping**: The system automatically extracts the `xxx` suffix at runtime to instantiate the central ledger under `storage/2_register_data/xxx_registry.csv`. No manual configuration is required when cloning this architecture for a new topic.
+- **Fixed Data Lake Hierarchy**: The folder names inside `storage/` (`1_raw_data`, `2_register_data`, `3_exploitable_data`) are strictly locked and immutable. Changing these names will break the background state synchronization workers.
+
 ## Data Lifecycle & State Matrix
 
-To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across three unified states inside master_registry.csv:
+To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across three unified states inside the dynamically generated registry:
 
-**Ingestion (1_raw_data):** System fetches the source file.
-`status_retrieved = Success | status_processed = Pending | status_raw = Present`
+**1. Ingestion (`1_raw_data`)**: System fetches the source file.
+`status_retrieved = Success | status_processed = None | status_raw = Present`
 
-**Transformation (3_exploitable_data):** Workers extract clean text chunks into Markdown.
+**2. Transformation (`3_exploitable_data`)**: Workers extract clean text chunks into Markdown.
 `status_retrieved = Success | status_processed = Terminated | status_raw = Present`
 
-**Purge (purge_worker):** Frees up disk space once file integrity is validated.
+**3. Purge (`purge_worker`)**: Frees up disk space once file integrity is validated.
 `status_retrieved = Success | status_processed = Terminated | status_raw = Purged`
 
-Note: If a paper sits behind an impenetrable paywall, status_retrieved switches to Failure. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written.
+Note: If a paper sits behind an impenetrable paywall, `status_retrieved` switches to `Failure`. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written.
 
 ## How to Run
 
@@ -48,22 +60,30 @@ python3 core/ingest.py
 
 **2. Run Multi-Block Expansion (Phase 2)**
 
-Scans 11 specific neuroscience and hardware domains as a first extension of the base ingestion engine. This script is intended as a template: future blocks covering new domains or sources can be added following the same pattern:
+Scans specific scientific sub-domains as a first extension of the base ingestion engine. This script is intended as a template: future blocks covering new domains or sources can be added following the same pattern:
 
 ```bash
 python3 core/ingest_blocks.py
+```
+
+**3. Run Structural Text Extraction (Phase 3)**
+
+Processes downloaded PDFs into clean Markdown files. Choose between the fast heuristic or the AI vision pipeline:
+
+```bash
+python3 core/clean_worker_fitz.py       # Fast CPU-Bound Heuristics
+# OR
+python3 core/clean_worker_marker.py     # Deep Learning Layout Transformer
 ```
 
 ### Storage Cleanup
 
 Once data has been retrieved and transformed, the storage layer can be cleaned to keep server usage under control.
 
-**3. Clear Server Storage**
+**4. Clear Server Storage**
 
 Safely purges downloaded PDFs whose content has already been compiled into verified, ultra-light Markdown files. This step only runs once file integrity has been validated against the registry, ensuring no data is lost in the process:
 
 ```bash
 python3 core/purge_worker.py
 ```
-
-NOTE : this script can be reused for other reasearch folder, it might need some tweaks to match the data.

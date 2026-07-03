@@ -1,1 +1,9 @@
-Here will be all scripts and data processing executionner
+# Core Execution Engine
+
+This directory contains all operational scripts, automated ingestion pipelines, and background worker daemons.
+
+## Content Breakdown
+- **Ingestion Tools**: Automated scripts interfacing with remote APIs to fetch metadata and source binaries.
+- **Background Workers**: Asynchronous engines managing layout analysis, data cleaning, and storage optimization.
+
+**Rule**: Scripts must use relative geometric path mapping (`__file__`) to remain completely deployment-agnostic.
