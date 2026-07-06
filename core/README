@@ -2,8 +2,14 @@
 
 This directory contains all operational scripts, automated ingestion pipelines, and background worker daemons.
 
+Note: this is a working base. Scripts are expected to be modified, extended, or replaced as the pipeline's needs evolve.
+
 ## Content Breakdown
-- **Ingestion Tools**: Automated scripts interfacing with remote APIs to fetch metadata and source binaries.
-- **Background Workers**: Asynchronous engines managing layout analysis, data cleaning, and storage optimization.
+
+- **Ingestion Tools** (`ingest.py`): A unified script interfacing with remote APIs (OpenAlex, with an Unpaywall fallback) to fetch metadata and source binaries, covering the base query and all domain-specific blocks in a single run.
+- **Background Workers**: Asynchronous engines managing layout analysis, data cleaning, chunking, and storage optimization.
+  - `clean_worker.py`: Adaptive PDF-to-Markdown extraction. Runs the fast, CPU-bound `fitz` heuristics first, and only escalates to Marker's vision-based layout model when extraction quality is insufficient — Marker's models are never loaded otherwise.
+  - `chunk_worker.py`: Splits cleaned Markdown into section-aware, metadata-rich chunks, ready for embedding into any vector store.
+  - `purge_worker.py`: Frees disk space by removing raw PDFs once their extraction has been validated. Supports `--dry-run` for a safe preview and `--min-quality` to retain raw files whose extraction quality was too low to trust.
 
 **Rule**: Scripts must use relative geometric path mapping (`__file__`) to remain completely deployment-agnostic.

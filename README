@@ -2,6 +2,8 @@
 
 A dynamic data center built from global scientific literature on neurosciences. This infrastructure is not static; it is designed to continuously adapt, scale, and ingest new research. The current configuration represents only the baseline foundation, engineered to expand as the field evolves.
 
+Note: the scripts in this repository are a working base and are expected to be modified, extended, or replaced as the pipeline's needs evolve.
+
 ## Directory Structure
 
 ```text
@@ -9,16 +11,16 @@ research-<topic>/
 ├── README.md                 # Project documentation
 ├── core/                     # Ingestion, processing and worker scripts
 │   ├── README.md             # Core execution engine documentation
-│   ├── ingest.py             # Base ingestion engine (Phase 1)
-│   ├── ingest_blocks.py      # Multi-block domain pipeline (Phase 2)
-│   ├── purge_worker.py       # Automated server storage cleaner
-│   ├── clean_worker_fitz.py  # Lightweight CPU text extraction worker
-│   └── clean_worker_marker.py# Vision Model text extraction worker
+│   ├── ingest.py             # Unified ingestion engine (base query + domain blocks)
+│   ├── clean_worker.py       # Adaptive PDF-to-Markdown extraction (fitz + Marker fallback)
+│   ├── chunk_worker.py       # Section-aware chunking with metadata
+│   └── purge_worker.py       # Automated server storage cleaner
 └── storage/                  # Multi-tier data lake
     ├── README.md             # Data lake storage tiers documentation
     ├── 1_raw_data/           # Temporary landing zone for heavy binary files (PDFs)
     ├── 2_register_data/      # Immutable entry point (<topic>_registry.csv)
-    └── 3_exploitable_data/   # Clean normalized text inputs (Markdown)
+    ├── 3_exploitable_data/   # Clean normalized text inputs (Markdown)
+    └── 4_vector_data/        # Chunked JSON, ready for embedding into any vector store
 ```
 
 ## Naming & Directory Conventions
@@ -27,63 +29,60 @@ To remain fully modular and deployment-agnostic across different research vector
 
 - **Root Directory Rule**: The root directory must follow the pattern `research-xxx` (e.g., `research-neurosciences`, `research-genetics`).
 - **Dynamic Registry Mapping**: The system automatically extracts the `xxx` suffix at runtime to instantiate the central ledger under `storage/2_register_data/xxx_registry.csv`. No manual configuration is required when cloning this architecture for a new topic.
-- **Fixed Data Lake Hierarchy**: The folder names inside `storage/` (`1_raw_data`, `2_register_data`, `3_exploitable_data`) are strictly locked and immutable. Changing these names will break the background state synchronization workers.
+- **Fixed Data Lake Hierarchy**: The folder names inside `storage/` (`1_raw_data`, `2_register_data`, `3_exploitable_data`, `4_vector_data`) are strictly locked and immutable. Changing these names will break the background state synchronization workers.
 
 ## Data Lifecycle & State Matrix
 
-To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across three unified states inside the dynamically generated registry:
+To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across unified states inside the dynamically generated registry:
 
 **1. Ingestion (`1_raw_data`)**: System fetches the source file.
-`status_retrieved = Success | status_processed = None | status_raw = Present`
+`status_retrieved = Success | status_processed = Pending | status_raw = Present`
 
-**2. Transformation (`3_exploitable_data`)**: Workers extract clean text chunks into Markdown.
+**2. Extraction (`3_exploitable_data`)**: Workers extract clean text into Markdown, tagged with the engine used and a quality score.
 `status_retrieved = Success | status_processed = Terminated | status_raw = Present`
+Additional columns: `extraction_engine` (`fitz` or `marker`), `extraction_quality` (0-1 score).
 
-**3. Purge (`purge_worker`)**: Frees up disk space once file integrity is validated.
+**3. Chunking (`4_vector_data`)**: The cleaned Markdown is split into metadata-rich chunks, one JSON file per article.
+`status_vectorized = Terminated`
+Additional columns: `chunked_path`, `num_chunks`.
+
+**4. Purge (`purge_worker`)**: Frees up disk space once file integrity is validated. Only the raw PDF is ever purged — `3_exploitable_data` and `4_vector_data` are permanent.
 `status_retrieved = Success | status_processed = Terminated | status_raw = Purged`
 
-Note: If a paper sits behind an impenetrable paywall, `status_retrieved` switches to `Failure`. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written.
+Note: If a paper sits behind an impenetrable paywall, `status_retrieved` switches to `Failure`. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written. HTML-sourced records (no PDF involved) are eventually marked `status_raw = NotApplicable`.
 
 ## How to Run
 
 ### Data Retrieval
 
-The retrieval layer is designed to be expandable: `ingest.py` and `ingest_blocks.py` are only the first two scripts in what is meant to become a growing library of ingestion pipelines. Additional blocks, domains, and sources can be added over time without breaking the existing registry structure, since deduplication is handled automatically across all scripts via DOIs and normalized titles.
-
-**1. Run Base Ingestion (Phase 1)**
-
-Collects the core baseline dataset directly from the master OpenAlex query. This is the foundational script all subsequent ingestion pipelines build on top of:
+The retrieval layer is designed to be expandable: `ingest.py` covers the base query and all domain-specific blocks in a single unified script, so future blocks or sources can be added over time without breaking the existing registry structure. Deduplication is handled automatically via DOIs and normalized titles, with a fallback to Unpaywall when the primary source link fails.
 
 ```bash
 python3 core/ingest.py
 ```
 
-**2. Run Multi-Block Expansion (Phase 2)**
+### Extraction & Cleaning
 
-Scans specific scientific sub-domains as a first extension of the base ingestion engine. This script is intended as a template: future blocks covering new domains or sources can be added following the same pattern:
+Processes downloaded PDFs into clean Markdown. The worker tries the fast, CPU-friendly `fitz` extraction first, and only escalates to the heavier Marker vision model when extraction quality is insufficient:
 
 ```bash
-python3 core/ingest_blocks.py
+python3 core/clean_worker.py
 ```
 
-**3. Run Structural Text Extraction (Phase 3)**
+### Chunking
 
-Processes downloaded PDFs into clean Markdown files. Choose between the fast heuristic or the AI vision pipeline:
+Splits each cleaned Markdown document into section-aware, metadata-rich chunks, persisted as JSON in `4_vector_data/` — ready to be embedded into whichever vector store is chosen later:
 
 ```bash
-python3 core/clean_worker_fitz.py       # Fast CPU-Bound Heuristics
-# OR
-python3 core/clean_worker_marker.py     # Deep Learning Layout Transformer
+python3 core/chunk_worker.py
 ```
 
 ### Storage Cleanup
 
-Once data has been retrieved and transformed, the storage layer can be cleaned to keep server usage under control.
-
-**4. Clear Server Storage**
-
-Safely purges downloaded PDFs whose content has already been compiled into verified, ultra-light Markdown files. This step only runs once file integrity has been validated against the registry, ensuring no data is lost in the process:
+Once a document's Markdown extraction has been validated, its raw PDF can be safely purged. This step never touches `3_exploitable_data` or `4_vector_data`, which are the permanent, reusable knowledge base this pipeline exists to build:
 
 ```bash
-python3 core/purge_worker.py
+python3 core/purge_worker.py --dry-run           # preview only
+python3 core/purge_worker.py                     # purge normally
+python3 core/purge_worker.py --min-quality 0.5   # keep raw PDFs with poor extraction quality, for future reprocessing
 ```
