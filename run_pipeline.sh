@@ -1,31 +1,54 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Stop execution immediately if any command exits with a non-zero status
-set -e
+source ~/.venv/bin/activate
 
-echo "--------------------------------------------------"
-echo "🚀 STARTING NEUROSCIENCE RESEARCH DATA PIPELINE"
-echo "--------------------------------------------------"
+SOURCE=""
+LIMIT=""
+PURGE=false
+YES=false
 
-# Step 1: Base Ingestion Engine (Phase 1)
-echo "LOG: Executing Base Ingestion..."
-python3 core/ingest.py
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source) SOURCE="$2"; shift 2 ;;
+        --limit) LIMIT="$2"; shift 2 ;;
+        --purge) PURGE=true; shift ;;
+        --yes) YES=true; shift ;;
+        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
 
-# Step 2: Heuristic PDF Text Extraction (Phase 2)
-echo "LOG: Running Dynamic Cleaner..."
-python3 core/clean_worker.py
+banner() {
+    echo "--------------------------------------------------"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1"
+    echo "--------------------------------------------------"
+}
 
-# Step 3: Chunking and Vectorization (Phase 3)
-echo "LOG: Running Chunk Worker..."
-python3 core/chunk_worker.py
+ingest_args=()
+[[ -n "$SOURCE" ]] && ingest_args+=(--source "$SOURCE")
+[[ -n "$LIMIT" ]] && ingest_args+=(--limit "$LIMIT")
 
-# Step 4: Purging (Phase 4)
-echo "LOG: Running Purge Worker..."
-read -p "Are you sure you want to purge the data? This action cannot be undone. (yes/no): " confirm
-if [[ "$confirm" == "yes" ]]; then
-    python3 core/purge_worker.py
+banner "ingest"
+python -m core.ingest "${ingest_args[@]}"
+
+limit_args=()
+[[ -n "$LIMIT" ]] && limit_args+=(--limit "$LIMIT")
+
+banner "extract"
+python -m core.extract "${limit_args[@]}"
+
+banner "chunk"
+python -m core.chunk "${limit_args[@]}"
+
+banner "embed"
+python -m core.embed "${limit_args[@]}"
+
+banner "report"
+python -m core.report
+
+if [[ "$PURGE" == true ]]; then
+    purge_args=()
+    [[ "$YES" == true ]] && purge_args+=(--yes)
+    banner "purge"
+    python -m core.purge "${purge_args[@]}"
 fi
-
-echo "--------------------------------------------------"
-echo "🏁 PIPELINE EXECUTION COMPLETED SUCCESSFULLY"
-echo "--------------------------------------------------"

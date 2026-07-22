@@ -1,88 +1,118 @@
 # Neuroscience Research Data Pipeline
 
-A dynamic data center built from global scientific literature on neurosciences. This infrastructure is not static; it is designed to continuously adapt, scale, and ingest new research. The current configuration represents only the baseline foundation, engineered to expand as the field evolves.
-
-Note: the scripts in this repository are a working base and are expected to be modified, extended, or replaced as the pipeline's needs evolve.
+A dynamic data center built from global scientific literature on neuroscience. The
+pipeline discovers papers across multiple open sources, extracts and chunks their full
+text, and embeds those chunks into a vector store — serving both a semantic-search / RAG
+index and a versioned training dataset. It is designed to keep growing as the field
+evolves and as new sources are added.
 
 ## Directory Structure
 
 ```text
 research-<topic>/
-├── README.md                 # Project documentation
-├── core/                     # Ingestion, processing and worker scripts
-│   ├── README.md             # Core execution engine documentation
-│   ├── ingest.py             # Unified ingestion engine (base query + domain blocks)
-│   ├── clean_worker.py       # Adaptive PDF-to-Markdown extraction (fitz + Marker fallback)
-│   ├── chunk_worker.py       # Section-aware chunking with metadata
-│   └── purge_worker.py       # Automated server storage cleaner
+├── README                    # Project documentation
+├── run_pipeline.sh           # Orchestrates ingest -> extract -> chunk -> embed -> report
+├── requirements.txt          # Python dependencies
+├── core/                     # Pipeline package (one module per stage)
+│   ├── config.py             # TOPIC autodetect, paths, EMAIL_CONTACT, KEYWORD_BLOCKS, model
+│   ├── registry.py           # SQLite control plane (papers + cursors, status FSM, dedup)
+│   ├── log.py                # Logging setup
+│   ├── sources/              # openalex.py, europepmc.py, crossref.py, resolvers.py
+│   ├── ingest.py             # discover -> dedup -> resolve -> fetch -> register
+│   ├── extract.py            # PDF -> Markdown (fitz first, Marker fallback, quality score)
+│   ├── chunk.py              # Markdown -> section-aware chunks
+│   ├── encoders.py           # Text encoder (bge-m3), batched, device auto
+│   ├── embed.py              # Chunks -> embeddings -> LanceDB
+│   ├── store.py              # LanceDB chunk table: search + parquet export
+│   ├── report.py             # QC statistics
+│   └── purge.py              # Raw-PDF cleanup (--min-quality retention)
 └── storage/                  # Multi-tier data lake
-    ├── README.md             # Data lake storage tiers documentation
-    ├── 1_raw_data/           # Temporary landing zone for heavy binary files (PDFs)
-    ├── 2_register_data/      # Immutable entry point (<topic>_registry.csv)
-    ├── 3_exploitable_data/   # Clean normalized text inputs (Markdown)
-    └── 4_vector_data/        # Chunked JSON, ready for embedding into any vector store
+    ├── 1_raw_data/           # Temporary landing zone for source PDFs
+    ├── 2_register_data/      # SQLite registry (<topic>_registry.db)
+    ├── 3_exploitable_data/   # Clean normalized text (Markdown)
+    └── 4_vector_data/        # Chunk JSON + LanceDB table (vectors + metadata)
 ```
 
 ## Naming & Directory Conventions
 
-To remain fully modular and deployment-agnostic across different research vectors, the system enforces strict geometric naming conventions:
+- **Root directory rule**: the root must follow `research-xxx` (e.g. `research-neurosciences`).
+- **Dynamic registry mapping**: the `xxx` suffix is extracted at runtime to instantiate the
+  ledger at `storage/2_register_data/xxx_registry.db`. No manual configuration when cloning
+  this architecture for a new topic.
+- **Fixed data-lake hierarchy**: the folder names inside `storage/` are locked and immutable.
 
-- **Root Directory Rule**: The root directory must follow the pattern `research-xxx` (e.g., `research-neurosciences`, `research-genetics`).
-- **Dynamic Registry Mapping**: The system automatically extracts the `xxx` suffix at runtime to instantiate the central ledger under `storage/2_register_data/xxx_registry.csv`. No manual configuration is required when cloning this architecture for a new topic.
-- **Fixed Data Lake Hierarchy**: The folder names inside `storage/` (`1_raw_data`, `2_register_data`, `3_exploitable_data`, `4_vector_data`) are strictly locked and immutable. Changing these names will break the background state synchronization workers.
+## Sources
 
-## Data Lifecycle & State Matrix
+Discovery runs across several complementary open sources; a shared resolver cascade turns
+each discovered paper into a downloadable PDF or scraped HTML.
 
-To ensure total coherence even when raw files are deleted to save server space, the system tracks the data lifecycle across unified states inside the dynamically generated registry:
+| Source | Role | How it is handled |
+|---|---|---|
+| OpenAlex | Primary discovery | `core.sources.openalex`, boolean keyword blocks, polite pool via `EMAIL_CONTACT` |
+| Europe PMC | Discovery (biomedical, OA full text) | `core.sources.europepmc`, `cursorMark` pagination |
+| Crossref | Discovery (broad DOI coverage) | `core.sources.crossref`, feeds the resolver cascade |
+| Unpaywall / Semantic Scholar / CORE | PDF resolution | `core.sources.resolvers`, fallback cascade after direct arXiv/PMC candidates |
 
-**1. Ingestion (`1_raw_data`)**: System fetches the source file.
-`status_retrieved = Success | status_processed = Pending | status_raw = Present`
+`sources/` stays pluggable — arXiv/bioRxiv can be added later behind the same `discover()`
+contract. Set a real contact address with `export NEURO_CONTACT_EMAIL=you@example.org`
+(OpenAlex and Unpaywall throttle empty contacts).
 
-**2. Extraction (`3_exploitable_data`)**: Workers extract clean text into Markdown, tagged with the engine used and a quality score.
-`status_retrieved = Success | status_processed = Terminated | status_raw = Present`
-Additional columns: `extraction_engine` (`fitz` or `marker`), `extraction_quality` (0-1 score).
+### Query breadth
 
-**3. Chunking (`4_vector_data`)**: The cleaned Markdown is split into metadata-rich chunks, one JSON file per article.
-`status_vectorized = Terminated`
-Additional columns: `chunked_path`, `num_chunks`.
+`config.KEYWORD_BLOCKS` covers neuroscience broadly (cognitive, systems/circuits,
+molecular/cellular, computational, neuroimaging, clinical neurology, neurodegeneration,
+psychiatry, addiction, developmental/aging, sensory systems, sleep/circadian,
+neuropharmacology, glia/neuroimmunology, neuromodulation, BCI, electrophysiology, and a
+wearable/ear-EEG cluster) to maximize corpus size. The blocks are freely editable.
 
-**4. Purge (`purge_worker`)**: Frees up disk space once file integrity is validated. Only the raw PDF is ever purged — `3_exploitable_data` and `4_vector_data` are permanent.
-`status_retrieved = Success | status_processed = Terminated | status_raw = Purged`
+## Data Lifecycle
 
-Note: If a paper sits behind an impenetrable paywall, `status_retrieved` switches to `Failure`. The API abstract is still safely archived in the registry for metadata exploration, but no local files are written. HTML-sourced records (no PDF involved) are eventually marked `status_raw = NotApplicable`.
+The SQLite registry tracks each paper through an explicit status machine. Papers are
+deduplicated across sources by canonical DOI, normalized title, and — after extraction —
+the SHA-256 hash of the Markdown body (near-duplicate full text).
+
+```
+discovered -> fetched -> extracted -> chunked -> embedded
+    └-> paywalled | empty | duplicate | failed   (terminal)
+```
+
+1. **Ingestion** (`core.ingest`): discovers papers per source × query block (pagination
+   cursors persisted per source × block), dedups, resolves an open-access URL, and fetches
+   a PDF (`fetched`) or scrapes HTML into Markdown (`extracted`). No OA source resolved →
+   `paywalled`, with the abstract retained.
+2. **Extraction** (`core.extract`): fitz first; escalates to Marker's vision model only when
+   the fitz quality score is low and Marker is installed. Writes Markdown with front-matter
+   to Tier 3. Identical full text already seen → `duplicate`.
+3. **Chunking** (`core.chunk`): splits Markdown into section-aware, metadata-rich chunks
+   (one JSON per paper) in Tier 4.
+4. **Embedding** (`core.embed`): batch-encodes all chunks (`bge-m3`) and upserts one row per
+   chunk into the LanceDB table — the RAG index. The table exports to Parquet for a dataset.
+5. **Reporting / Purge** (`core.report`, `core.purge`): QC statistics; and raw-PDF cleanup
+   that only ever touches Tier 1.
 
 ## How to Run
 
-### Data Retrieval
-
-The retrieval layer is designed to be expandable: `ingest.py` covers the base query and all domain-specific blocks in a single unified script, so future blocks or sources can be added over time without breaking the existing registry structure. Deduplication is handled automatically via DOIs and normalized titles, with a fallback to Unpaywall when the primary source link fails.
-
 ```bash
-python3 core/ingest.py
+pip install -r requirements.txt
+export NEURO_CONTACT_EMAIL=you@example.org   # OpenAlex polite pool + Unpaywall
 ```
 
-### Extraction & Cleaning
-
-Processes downloaded PDFs into clean Markdown. The worker tries the fast, CPU-friendly `fitz` extraction first, and only escalates to the heavier Marker vision model when extraction quality is insufficient:
+Stages run as package modules from the project root:
 
 ```bash
-python3 core/clean_worker.py
+python -m core.ingest --limit 50        # discover + fetch (all sources, or --source openalex,crossref)
+python -m core.extract                  # PDF -> Markdown
+python -m core.chunk                    # Markdown -> chunks
+python -m core.embed                    # chunks -> LanceDB
+python -m core.report                   # QC stats
+python -m core.store --export out.parquet   # dataset export
+python -m core.purge --dry-run          # then --yes / --min-quality 0.5
 ```
 
-### Chunking
-
-Splits each cleaned Markdown document into section-aware, metadata-rich chunks, persisted as JSON in `4_vector_data/` — ready to be embedded into whichever vector store is chosen later:
+### All in One
 
 ```bash
-python3 core/chunk_worker.py
+./run_pipeline.sh                       # optional: --source, --limit N, --purge, --yes
 ```
 
-### Storage Cleanup
-
-Once a document's Markdown extraction has been validated, its raw PDF can be safely purged. This step never touches `3_exploitable_data` or `4_vector_data`, which are the permanent, reusable knowledge base this pipeline exists to build:
-
-```bash
-python3 core/purge_worker.py --dry-run           # preview only
-python3 core/purge_worker.py                     # purge normally
-python3 core/purge_worker.py --min-quality 0.5   # keep raw PDFs with poor extraction quality, for future reprocessing
-```
+`marker-pdf` is optional: without it, extraction runs on fitz alone.

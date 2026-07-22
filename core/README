@@ -1,15 +1,45 @@
 # Core Execution Engine
 
-This directory contains all operational scripts, automated ingestion pipelines, and background worker daemons.
+This package holds the ingestion, processing, and worker modules. Each stage is one module
+with a single job and a `run_x()` entry point, invoked as `python -m core.<stage>`.
+Operational state lives in a SQLite control plane; the chunk vectors and metadata live in a
+LanceDB data plane. `run_pipeline.sh` orchestrates the stages.
 
-Note: this is a working base. Scripts are expected to be modified, extended, or replaced as the pipeline's needs evolve.
+## Layout
 
-## Content Breakdown
+- **`config.py`** — `TOPIC` (from the `research-<topic>` folder), storage paths,
+  `EMAIL_CONTACT` (env `NEURO_CONTACT_EMAIL`), optional API keys, the `KEYWORD_BLOCKS`
+  query set, chunk parameters, the embedding model, and device selection. All paths derive
+  from `__file__`.
+- **`registry.py`** — the SQLite control plane at paper grain. `papers` and `cursors`
+  tables, the status FSM (`discovered`, `fetched`, `extracted`, `chunked`, `embedded`,
+  `paywalled`, `empty`, `duplicate`, `failed`), atomic upserts that preserve `created_at`,
+  canonical-DOI / normalized-title / content-hash dedup, and per-source pagination cursors
+  stored as opaque JSON.
+- **`log.py`** — logging setup (console + `storage/pipeline.log`).
+- **`sources/`** — discovery and resolution.
+  - `openalex.py`, `europepmc.py`, `crossref.py`: each exposes `discover(block, query,
+    cursor, per_page)` yielding normalized paper records and the next pagination cursor.
+  - `resolvers.py`: the shared candidate cascade — direct arXiv/PMC/OA links plus the
+    Unpaywall / Semantic Scholar / CORE fallbacks — applied to every discovered paper.
+- **`ingest.py`** — orchestrates discovery across sources and query blocks: dedups against
+  the registry, resolves an open-access URL, fetches a PDF or scrapes HTML to Markdown, and
+  registers each paper. Re-resolves a `paywalled` paper when a later source offers an OA
+  candidate.
+- **`extract.py`** — PDF → Markdown. Runs fitz across processes; escalates to Marker's
+  vision model only when fitz quality is low and Marker is installed. Marks a paper
+  `duplicate` when its full text hashes to one already extracted.
+- **`chunk.py`** — splits Markdown into section-aware, metadata-rich chunks (one JSON per
+  paper).
+- **`encoders.py`** — the `bge-m3` text encoder: lazy-loaded, batched, L2-normalized, CUDA
+  when available. Pluggable so a biomedical embedder can be swapped in later.
+- **`embed.py`** — batch-encodes every chunk and upserts one row per chunk into LanceDB.
+- **`store.py`** — LanceDB access: the chunk table schema, idempotent upsert by `chunk_id`,
+  vector search (the RAG entry point), and Parquet export.
+- **`report.py`** — QC statistics over the registry (counts per status, source, query
+  block, extraction engine, and total chunks).
+- **`purge.py`** — frees disk space by clearing raw PDFs of validated papers only, with
+  `--min-quality` retention for future reprocessing.
 
-- **Ingestion Tools** (`ingest.py`): A unified script interfacing with remote APIs (OpenAlex, with an Unpaywall fallback) to fetch metadata and source binaries, covering the base query and all domain-specific blocks in a single run.
-- **Background Workers**: Asynchronous engines managing layout analysis, data cleaning, chunking, and storage optimization.
-  - `clean_worker.py`: Adaptive PDF-to-Markdown extraction. Runs the fast, CPU-bound `fitz` heuristics first, and only escalates to Marker's vision-based layout model when extraction quality is insufficient — Marker's models are never loaded otherwise.
-  - `chunk_worker.py`: Splits cleaned Markdown into section-aware, metadata-rich chunks, ready for embedding into any vector store.
-  - `purge_worker.py`: Frees disk space by removing raw PDFs once their extraction has been validated. Supports `--dry-run` for a safe preview and `--min-quality` to retain raw files whose extraction quality was too low to trust.
-
-**Rule**: Scripts must use relative geometric path mapping (`__file__`) to remain completely deployment-agnostic.
+**Rule**: all modules resolve paths from `__file__` (via `config.py`) so they stay
+deployment-agnostic.

@@ -1,12 +1,23 @@
 # Multi-Tier Data Lake
 
-This directory houses all data assets partitioned into four strict logical tiers based on their processing maturity.
+This directory houses all data assets partitioned into four strict logical tiers based on
+their processing maturity.
 
 ## Storage Tiers
 
-- **`1_raw_data/` (Bronze Tier)**: Temporary landing zone for heavy binary files (e.g., source PDFs). Content here is highly volatile and subject to automated purges once its extraction has been validated.
-- **`2_register_data/` (Silver Tier)**: Central immutable ledger tracking global system states (`_registry.csv`).
-  - **CRITICAL RULE**: This folder and its contents **CANNOT** be deleted or manually altered. It acts as the single source of truth for deduplication and pipeline state.
-- **`3_exploitable_data/` (Gold Tier)**: Normalized, structured, and ultra-light text assets (Markdown) optimized for direct agent exploitation.
-  - **CRITICAL RULE**: This folder is permanent and must never be purged. Unlike `1_raw_data`, it is not regenerable without re-running extraction, and it is the reusable knowledge base the rest of the pipeline exists to build.
-- **`4_vector_data/` (Platinum Tier)**: Section-aware, metadata-rich chunks (JSON) derived from the Gold tier, ready to be embedded into any vector store. No specific database is assumed — this tier stays store-agnostic by design.
+- **`1_raw_data/` (Bronze Tier)**: Temporary landing zone for source PDFs. Content here is
+  volatile and subject to automated purges once its extraction has been validated.
+- **`2_register_data/` (Silver Tier)**: The SQLite control plane (`<topic>_registry.db`)
+  tracking global system state — the `papers` and `cursors` tables, the status FSM, and the
+  dedup keys (canonical DOI, normalized title, content hash).
+  - **CRITICAL RULE**: This folder and its contents must not be deleted or manually altered.
+    It is the single source of truth for deduplication and pipeline state.
+- **`3_exploitable_data/` (Gold Tier)**: Normalized, structured, ultra-light text assets
+  (Markdown with front-matter) optimized for direct agent exploitation.
+  - **CRITICAL RULE**: This folder is permanent and must never be purged. Unlike
+    `1_raw_data`, it is not regenerable without re-running extraction, and it is the
+    reusable knowledge base the rest of the pipeline exists to build.
+- **`4_vector_data/` (Platinum Tier)**: Section-aware chunk JSON derived from the Gold tier,
+  and the LanceDB table that holds one embedded row per chunk (vector + metadata). This tier
+  serves both the semantic-search / RAG index and a versioned training-dataset export to
+  Parquet.

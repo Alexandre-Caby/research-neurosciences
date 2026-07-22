@@ -1,0 +1,9 @@
+requests
+beautifulsoup4
+pandas
+sentence-transformers
+torch
+pymupdf
+html2text
+lancedb
+pytest

@@ -1,36 +1,18 @@
 import os
-import re
+import argparse
 from statistics import median
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import pandas as pd
 import fitz  # PyMuPDF
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-QUALITY_THRESHOLD = 0.6   # below this score, escalate from fitz to Marker
-BOILERPLATE_MIN_PAGES = 4  # only run header/footer dedup on documents with enough pages
+from core import config
+from core import registry as R
+from core.log import get_logger
 
-# Dynamically resolve root project folder name
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(SCRIPT_DIR)
-ROOT_NAME = os.path.basename(ROOT_DIR)
-TOPIC = ROOT_NAME.replace("research-", "") if "research-" in ROOT_NAME else ROOT_NAME
+logger = get_logger(__name__)
 
-STORAGE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../storage"))
-RAW_DIR = os.path.join(STORAGE_DIR, "1_raw_data")
-REG_DIR = os.path.join(STORAGE_DIR, "2_register_data")
-EXP_DIR = os.path.join(STORAGE_DIR, "3_exploitable_data")
+BOILERPLATE_MIN_PAGES = 4
 
-for folder in [RAW_DIR, REG_DIR, EXP_DIR]:
-    os.makedirs(folder, exist_ok=True)
-
-REGISTRY_FILE = os.path.join(REG_DIR, f"{TOPIC}_registry.csv")
-
-
-# ---------------------------------------------------------------------------
-# Marker: lazy-loaded, optional
-# ---------------------------------------------------------------------------
 _marker_state = {"converter": None, "text_from_rendered": None, "available": True}
 
 
@@ -43,18 +25,15 @@ def get_marker():
             from marker.models import create_model_dict
             from marker.output import text_from_rendered
         except ImportError:
-            print("   Warning: marker-pdf not installed. Fallback disabled, keeping fitz output as-is.")
+            logger.warning("marker-pdf not installed; Marker fallback disabled.")
             _marker_state["available"] = False
             return None, None
-        print("System: Loading Marker vision models (first use only -- can be slow on CPU)...")
+        logger.info("Loading Marker vision models (first use only)...")
         _marker_state["converter"] = PdfConverter(artifact_dict=create_model_dict())
         _marker_state["text_from_rendered"] = text_from_rendered
     return _marker_state["converter"], _marker_state["text_from_rendered"]
 
 
-# ---------------------------------------------------------------------------
-# Fitz extraction
-# ---------------------------------------------------------------------------
 def extract_with_fitz(pdf_path):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
@@ -138,9 +117,6 @@ def extract_with_fitz(pdf_path):
     return "\n\n".join(markdown_lines)
 
 
-# ---------------------------------------------------------------------------
-# Quality control
-# ---------------------------------------------------------------------------
 def assess_quality(text):
     if not text or len(text.strip()) < 300:
         return 0.0, "too_short"
@@ -166,24 +142,21 @@ def assess_quality(text):
     return max(score, 0.0), (",".join(reasons) if reasons else "ok")
 
 
-# ---------------------------------------------------------------------------
-# Adaptive engine selection
-# ---------------------------------------------------------------------------
 def process_pdf(pdf_path):
     """Try fitz first (cheap, CPU-friendly). Escalate to Marker only if
     quality is insufficient. Returns (markdown_text, engine_used, quality_score)."""
     try:
         fitz_text = extract_with_fitz(pdf_path)
     except Exception as e:
-        print(f"   Fitz extraction crashed: {e}")
+        logger.warning("Fitz extraction crashed on %s: %s", pdf_path, e)
         fitz_text = ""
 
     fitz_score, reason = assess_quality(fitz_text)
 
-    if fitz_score >= QUALITY_THRESHOLD:
+    if fitz_score >= config.QUALITY_THRESHOLD:
         return fitz_text, "fitz", fitz_score
 
-    print(f"   Fitz quality insufficient ({reason}, score={fitz_score:.2f}). Escalating to Marker...")
+    logger.info("Fitz quality insufficient (%s, score=%.2f). Escalating to Marker...", reason, fitz_score)
     converter, text_from_rendered = get_marker()
     if converter is None:
         return fitz_text, "fitz", fitz_score
@@ -192,7 +165,7 @@ def process_pdf(pdf_path):
         rendered = converter(pdf_path)
         marker_text, _, _ = text_from_rendered(rendered)
     except Exception as e:
-        print(f"   Marker crashed: {e}")
+        logger.warning("Marker crashed on %s: %s", pdf_path, e)
         return fitz_text, "fitz", fitz_score
 
     marker_score, _ = assess_quality(marker_text)
@@ -201,17 +174,11 @@ def process_pdf(pdf_path):
     return fitz_text, "fitz", fitz_score
 
 
-# ---------------------------------------------------------------------------
-# Knowledge-base friendly output
-# ---------------------------------------------------------------------------
-def build_front_matter(df, idx, engine, quality):
-    def _get(col, default="N/A"):
-        return df.at[idx, col] if col in df.columns else default
-
-    title = str(_get("Titre", "Unknown")).replace('"', "'")
-    doi = _get("DOI", "N/A")
-    year = _get("Annee", "N/A")
-    block = _get("Bloc_Origine", "N/A")
+def build_front_matter(meta, engine, quality):
+    title = str(meta.get("title") or "Unknown").replace('"', "'")
+    doi = meta.get("doi") or "N/A"
+    year = meta.get("year") if meta.get("year") is not None else "N/A"
+    block = meta.get("query_block") or "N/A"
 
     return (
         "---\n"
@@ -225,62 +192,78 @@ def build_front_matter(df, idx, engine, quality):
     )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def execute_clean_worker():
-    if not os.path.exists(REGISTRY_FILE):
-        print("Error: Registry missing.")
+def _fitz_only(pdf_path):
+    """Top-level, picklable: fitz extraction + quality only, for worker processes."""
+    try:
+        text = extract_with_fitz(pdf_path)
+    except Exception as e:
+        return "", 0.0, f"fitz_error:{e}"
+    score, reason = assess_quality(text)
+    return text, score, reason
+
+
+def run_extract(limit=None, workers=None):
+    conn = R.connect(config.DB_PATH)
+    papers = [p for p in R.get_by_status(conn, R.FETCHED) if p["raw_path"] and os.path.exists(p["raw_path"])]
+    if limit:
+        papers = papers[:limit]
+
+    if not papers:
+        logger.info("No fetched PDFs to extract.")
         return
 
-    df = pd.read_csv(REGISTRY_FILE)
-    mask = (df["status_retrieved"] == "Success") & (df["status_processed"] == "Pending")
-    pending_indices = df[mask].index
+    fitz_results = {}
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_fitz_only, p["raw_path"]): p["paper_id"] for p in papers}
+        for future in as_completed(futures):
+            paper_id = futures[future]
+            try:
+                fitz_results[paper_id] = future.result()
+            except Exception as e:
+                fitz_results[paper_id] = ("", 0.0, f"worker_error:{e}")
 
-    if len(pending_indices) == 0:
-        print("System: No pending PDFs to process.")
-        return
+    for paper in papers:
+        paper_id = paper["paper_id"]
+        fitz_text, fitz_score, reason = fitz_results[paper_id]
 
-    print(f"System: {len(pending_indices)} PDFs pending. Adaptive engine ready (fitz first, Marker fallback).")
+        markdown, engine, quality = fitz_text, "fitz", fitz_score
+        if fitz_score < config.QUALITY_THRESHOLD:
+            logger.info("Fitz quality insufficient for %s (%s, score=%.2f).", paper_id, reason, fitz_score)
+            converter, text_from_rendered = get_marker()
+            if converter is not None:
+                try:
+                    rendered = converter(paper["raw_path"])
+                    marker_text, _, _ = text_from_rendered(rendered)
+                    marker_score, _ = assess_quality(marker_text)
+                    if marker_score > fitz_score:
+                        markdown, engine, quality = marker_text, "marker", marker_score
+                except Exception as e:
+                    logger.warning("Marker crashed on %s: %s", paper_id, e)
 
-    for idx in pending_indices:
-        raw_pdf_path = str(df.at[idx, "raw_path"])
-
-        if not os.path.exists(raw_pdf_path):
-            df.at[idx, "status_processed"] = "Failure"
-            continue
-
-        print(f"System: Open and testing layout for -> {os.path.basename(raw_pdf_path)}")
-        
-        try:
-            md_content, engine_used, quality_score = process_pdf(raw_pdf_path)
-        except Exception as e:
-            print(f"Extraction error on {raw_pdf_path}: {e}")
-            df.at[idx, "status_processed"] = "Failure"
-            continue
-
-        if len(md_content.strip()) > 300:
-            filename = os.path.basename(raw_pdf_path).replace(".pdf", ".md")
-            output_md_path = os.path.join(EXP_DIR, filename)
-            front_matter = build_front_matter(df, idx, engine_used, quality_score)
-
-            with open(output_md_path, "w", encoding="utf-8") as f:
-                f.write(front_matter + md_content)
-
-            df.at[idx, "status_processed"] = "Terminated"
-            df.at[idx, "processed_path"] = output_md_path
-            df.at[idx, "extraction_engine"] = engine_used
-            df.at[idx, "extraction_quality"] = round(quality_score, 2)
-            print(f"Processed ({engine_used}, q={quality_score:.2f}): {filename}")
+        if len(markdown.strip()) > 300:
+            content_hash = R.content_hash(markdown)
+            dup_id = R.hash_seen(conn, content_hash)
+            if dup_id and dup_id != paper_id:
+                R.update_status(conn, paper_id, R.DUPLICATE, content_hash=content_hash)
+                logger.info("Duplicate content (matches %s): %s", dup_id, paper_id)
+            else:
+                md_path = os.path.join(config.EXP_DIR, f"{paper_id}.md")
+                front_matter = build_front_matter(dict(paper), engine, quality)
+                with open(md_path, "w", encoding="utf-8") as f:
+                    f.write(front_matter + markdown)
+                R.update_status(conn, paper_id, R.EXTRACTED, md_path=md_path,
+                                 extraction_engine=engine, extraction_quality=round(quality, 2),
+                                 content_hash=content_hash)
+                logger.info("Extracted (%s, q=%.2f): %s", engine, quality, paper_id)
         else:
-            df.at[idx, "status_processed"] = "Failure"
-            df.at[idx, "extraction_engine"] = engine_used
-            df.at[idx, "extraction_quality"] = round(quality_score, 2)
-
-    df.to_csv(REGISTRY_FILE, index=False)
+            R.update_status(conn, paper_id, R.FAILED, extraction_engine=engine,
+                             extraction_quality=round(quality, 2))
+            logger.info("Extraction failed: %s", paper_id)
 
 
 if __name__ == "__main__":
-    import faulthandler
-    faulthandler.enable()
-    execute_clean_worker()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=None)
+    args = parser.parse_args()
+    run_extract(limit=args.limit, workers=args.workers)
