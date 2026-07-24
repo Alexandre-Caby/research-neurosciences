@@ -5,6 +5,7 @@ source ~/.venv/bin/activate
 
 SOURCE=""
 LIMIT=""
+WORKERS=""
 PURGE=false
 YES=false
 
@@ -12,6 +13,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --source) SOURCE="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
+        --workers) WORKERS="$2"; shift 2 ;;
         --purge) PURGE=true; shift ;;
         --yes) YES=true; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
@@ -34,8 +36,11 @@ python -m core.ingest "${ingest_args[@]}"
 limit_args=()
 [[ -n "$LIMIT" ]] && limit_args+=(--limit "$LIMIT")
 
+extract_args=("${limit_args[@]}")
+[[ -n "$WORKERS" ]] && extract_args+=(--workers "$WORKERS")
+
 banner "extract"
-python -m core.extract "${limit_args[@]}"
+python -m core.extract "${extract_args[@]}"
 
 banner "chunk"
 python -m core.chunk "${limit_args[@]}"

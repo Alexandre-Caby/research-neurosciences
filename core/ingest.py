@@ -1,6 +1,7 @@
 """Ingestion orchestrator: discover (multi-source) -> dedup -> resolve -> fetch -> register."""
 import argparse
 import os
+from turtle import title
 
 import html2text
 import requests
@@ -27,38 +28,45 @@ _h2t.ignore_links = False
 
 
 def download_pdf(url, dest_stub):
-    res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     try:
-        if res.status_code != 200 or res.content[:5] != b"%PDF-":
-            return None
-        path = os.path.join(config.RAW_DIR, f"{dest_stub}.pdf")
-        with open(path, "wb") as f:
-            f.write(res.content)
-        return path
-    finally:
-        res.close()
-
+        res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        try:
+            if res.status_code != 200 or res.content[:5] != b"%PDF-":
+                return None
+            path = os.path.join(config.RAW_DIR, f"{dest_stub}.pdf")
+            with open(path, "wb") as f:
+                f.write(res.content)
+            return path
+        finally:
+            res.close()
+    except requests.RequestException as e:
+        logger.warning("Failed PDF fetch from %s: %s", url, e)
+        return None
 
 def scrape_html_to_md(url, dest_stub):
-    res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     try:
-        if res.status_code != 200:
-            return None
-        soup = BeautifulSoup(res.text, "html.parser")
-        for el in soup(["script", "style", "nav", "footer", "header"]):
-            el.decompose()
-        body = soup.find("article") or soup.find("main") or soup.body
-        if not body:
-            return None
-        markdown_text = _h2t.handle(str(body))
-        if len(markdown_text.strip()) <= 300:
-            return None
-        path = os.path.join(config.EXP_DIR, f"{dest_stub}.md")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(markdown_text)
-        return path
-    finally:
-        res.close()
+        res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        try:
+            if res.status_code != 200:
+                return None
+            soup = BeautifulSoup(res.text, "html.parser")
+            for el in soup(["script", "style", "nav", "footer", "header"]):
+                el.decompose()
+            body = soup.find("article") or soup.find("main") or soup.body
+            if not body:
+                return None
+            markdown_text = _h2t.handle(str(body))
+            if len(markdown_text.strip()) <= 300:
+                return None
+            path = os.path.join(config.EXP_DIR, f"{dest_stub}.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(markdown_text)
+            return path
+        finally:
+            res.close()
+    except requests.RequestException as e:
+        logger.warning("Failed HTML scrape from %s: %s", url, e)
+        return None
 
 
 def _default_cursor(source_name):
@@ -110,6 +118,10 @@ def _retry_paywalled(conn, existing_id, record):
 def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_page=25):
     R.init_db(config.DB_PATH)
     conn = R.connect(config.DB_PATH)
+    known_dois, known_titles, known_statuses = R.get_known_identifiers(conn)
+    logger.info("Ingest: %d DOIs and %d titles pre-loaded in memory for fast skip.",
+                len(known_dois), len(known_titles))
+    
     registered = 0
 
     for source_name in sources:
@@ -132,7 +144,9 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
 
                 doi = R.canonical_doi(record.get("doi"))
                 title = record.get("title")
-                existing_id = (doi and R.doi_seen(conn, doi)) or (title and R.title_seen(conn, title))
+                norm_title = R.normalize_title(title) if title else None
+
+                existing_id = (doi and known_dois.get(doi)) or (norm_title and known_titles.get(norm_title))
                 if existing_id:
                     if R.get_status(conn, existing_id) == R.PAYWALLED:
                         _retry_paywalled(conn, existing_id, record)
@@ -151,6 +165,11 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
                     landing_url=record.get("landing_url"), status=R.DISCOVERED,
                 )
                 registered += 1
+
+                if doi:
+                    known_dois[doi] = paper_id
+                if norm_title:
+                    known_titles[norm_title] = paper_id
 
                 candidates = resolvers.resolve(record)
                 kind, path, used = _try_fetch(candidates, paper_id)

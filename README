@@ -76,17 +76,22 @@ discovered -> fetched -> extracted -> chunked -> embedded
     └-> paywalled | empty | duplicate | failed   (terminal)
 ```
 
-1. **Ingestion** (`core.ingest`): discovers papers per source × query block (pagination
+1. **Ingestion** (`core.ingest`): preloads DOIs and titles into RAM for an instant
+   $O(1)$ skip on re-runs, then discovers papers per source × query block (pagination
    cursors persisted per source × block), dedups, resolves an open-access URL, and fetches
    a PDF (`fetched`) or scrapes HTML into Markdown (`extracted`). No OA source resolved →
    `paywalled`, with the abstract retained.
 2. **Extraction** (`core.extract`): fitz first; escalates to Marker's vision model only when
-   the fitz quality score is low and Marker is installed. Writes Markdown with front-matter
-   to Tier 3. Identical full text already seen → `duplicate`.
+   the fitz quality score is low and Marker is installed. Uses SQLite checkpoints in real
+   time, paper by paper (`as_completed`), and releases GPU VRAM (`torch.cuda.empty_cache()`)
+   after Marker. Writes Markdown with front-matter to Tier 3. Identical full text already
+   seen → `duplicate`.
 3. **Chunking** (`core.chunk`): splits Markdown into section-aware, metadata-rich chunks
    (one JSON per paper) in Tier 4.
-4. **Embedding** (`core.embed`): batch-encodes all chunks (`bge-m3`) and upserts one row per
-   chunk into the LanceDB table — the RAG index. The table exports to Parquet for a dataset.
+4. **Embedding** (`core.embed`): encodes chunks in mini-batches (for example, 32 papers) to
+   avoid OOMs, upserts one row per chunk into the LanceDB table — the RAG index, and
+   automatically deletes temporary chunk JSON files after successful insertion. The table
+   exports to Parquet for a dataset.
 5. **Reporting / Purge** (`core.report`, `core.purge`): QC statistics; and raw-PDF cleanup
    that only ever touches Tier 1.
 
@@ -112,7 +117,7 @@ python -m core.purge --dry-run          # then --yes / --min-quality 0.5
 ### All in One
 
 ```bash
-./run_pipeline.sh                       # optional: --source, --limit N, --purge, --yes
+./run_pipeline.sh                       # optional: --source, --limit N, --workers N, --purge, --yes
 ```
 
 `marker-pdf` is optional: without it, extraction runs on fitz alone.

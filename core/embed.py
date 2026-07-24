@@ -1,8 +1,8 @@
-"""Batch-encodes chunked papers and upserts their chunk vectors into LanceDB."""
+"""Batch-encodes chunked papers into LanceDB with streaming checkpoints and inode cleanup."""
+
 import argparse
 import json
 import os
-
 from core import config
 from core import registry as R
 from core.store import LanceStore
@@ -43,52 +43,73 @@ def _row_to_lance(chunk, paper_row):
     }
 
 
-def run_embed(text_encoder=None, limit=None) -> None:
+def run_embed(text_encoder=None, limit=None, batch_size=32, purge_chunks_json=True) -> None:
     if text_encoder is None:
         from core.encoders import TextEncoder
         text_encoder = TextEncoder()
 
     conn = R.connect(config.DB_PATH)
     papers = R.get_by_status(conn, R.CHUNKED)
+
     if limit is not None:
         papers = papers[:limit]
-
-    all_chunks = []
-    embedded_paper_ids = []
-    for row in papers:
-        paper_id, chunks_path = row["paper_id"], row["chunks_path"]
-
-        if not chunks_path or not os.path.exists(chunks_path):
-            R.update_status(conn, paper_id, R.EMPTY, error="chunks_path missing")
-            continue
-
-        with open(chunks_path, "r", encoding="utf-8") as f:
-            chunks = json.load(f)
-
-        if not chunks:
-            R.update_status(conn, paper_id, R.EMPTY, error="no chunks in file")
-            continue
-
-        for chunk in chunks:
-            all_chunks.append(_row_to_lance(chunk, row))
-        embedded_paper_ids.append(paper_id)
-
-    if not all_chunks:
+    if not papers:
+        logger.info("No chunked papers to embed.")
         return
 
-    vectors = text_encoder.encode([c["text"] for c in all_chunks])
-    for chunk_row, vector in zip(all_chunks, vectors):
-        chunk_row["vector"] = vector
+    store = LanceStore(lance_dir=config.LANCE_DIR)
+    logger.info("Embedding %d papers in mini-batches of %d...", len(papers), batch_size)
 
-    LanceStore(lance_dir=config.LANCE_DIR).upsert(all_chunks)
+    for i in range(0, len(papers), batch_size):
+        batch_papers = papers[i : i + batch_size]
+        batch_chunks = []
+        embedded_paper_ids = []
+        json_paths_to_purge = []
 
-    for paper_id in embedded_paper_ids:
-        R.update_status(conn, paper_id, R.EMBEDDED)
-        logger.info("embedded %s", paper_id)
+        for row in batch_papers:
+            paper_id, chunks_path = row["paper_id"], row["chunks_path"]
+            if not chunks_path or not os.path.exists(chunks_path):
+                R.update_status(conn, paper_id, R.EMPTY, error="chunks_path missing")
+                continue
+
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            if not chunks:
+                R.update_status(conn, paper_id, R.EMPTY, error="no chunks in file")
+                continue
+
+            for chunk in chunks:
+                batch_chunks.append(_row_to_lance(chunk, row))
+
+            embedded_paper_ids.append(paper_id)
+            json_paths_to_purge.append(chunks_path)
+
+        if not batch_chunks:
+            continue
+
+        vectors = text_encoder.encode([c["text"] for c in batch_chunks])
+        for chunk_row, vector in zip(batch_chunks, vectors):
+            chunk_row["vector"] = vector
+
+        store.upsert(batch_chunks)
+
+        for paper_id in embedded_paper_ids:
+            R.update_status(conn, paper_id, R.EMBEDDED)
+            logger.info("Embedded: %s", paper_id)
+
+        if purge_chunks_json:
+            for json_p in json_paths_to_purge:
+                try:
+                    if os.path.exists(json_p):
+                        os.remove(json_p)
+                except OSError as e:
+                    logger.warning("Failed to purge chunk json %s: %s", json_p, e)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Embed chunked papers into LanceDB.")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
-    run_embed(limit=args.limit)
+    run_embed(limit=args.limit, batch_size=args.batch_size)

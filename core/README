@@ -14,26 +14,31 @@ LanceDB data plane. `run_pipeline.sh` orchestrates the stages.
 - **`registry.py`** — the SQLite control plane at paper grain. `papers` and `cursors`
   tables, the status FSM (`discovered`, `fetched`, `extracted`, `chunked`, `embedded`,
   `paywalled`, `empty`, `duplicate`, `failed`), atomic upserts that preserve `created_at`,
-  canonical-DOI / normalized-title / content-hash dedup, and per-source pagination cursors
-  stored as opaque JSON.
+  canonical-DOI / normalized-title / content-hash dedup, `get_known_identifiers()` for
+  instant in-memory $O(1)$ fast-skip, and per-source pagination cursors stored as opaque
+  JSON.
 - **`log.py`** — logging setup (console + `storage/pipeline.log`).
 - **`sources/`** — discovery and resolution.
   - `openalex.py`, `europepmc.py`, `crossref.py`: each exposes `discover(block, query,
     cursor, per_page)` yielding normalized paper records and the next pagination cursor.
   - `resolvers.py`: the shared candidate cascade — direct arXiv/PMC/OA links plus the
     Unpaywall / Semantic Scholar / CORE fallbacks — applied to every discovered paper.
-- **`ingest.py`** — orchestrates discovery across sources and query blocks: dedups against
-  the registry, resolves an open-access URL, fetches a PDF or scrapes HTML to Markdown, and
-  registers each paper. Re-resolves a `paywalled` paper when a later source offers an OA
-  candidate.
-- **`extract.py`** — PDF → Markdown. Runs fitz across processes; escalates to Marker's
-  vision model only when fitz quality is low and Marker is installed. Marks a paper
-  `duplicate` when its full text hashes to one already extracted.
+- **`ingest.py`** — orchestrates discovery across sources and query blocks: performs an
+  instant in-RAM skip before any network call, dedups against the registry, resolves an
+  open-access URL, fetches a PDF or scrapes HTML to Markdown, and registers each paper.
+  Re-resolves a `paywalled` paper when a later source offers an OA candidate.
+- **`extract.py`** — PDF → Markdown. Runs fitz across processes with per-paper SQLite
+  checkpoints via `as_completed`; escalates to Marker's vision model only when fitz quality
+  is low and Marker is installed; and releases GPU VRAM with `torch.cuda.empty_cache()`
+  after Marker. Marks a paper `duplicate` when its full text hashes to one already
+  extracted.
 - **`chunk.py`** — splits Markdown into section-aware, metadata-rich chunks (one JSON per
   paper).
 - **`encoders.py`** — the `bge-m3` text encoder: lazy-loaded, batched, L2-normalized, CUDA
   when available. Pluggable so a biomedical embedder can be swapped in later.
-- **`embed.py`** — batch-encodes every chunk and upserts one row per chunk into LanceDB.
+- **`embed.py`** — batch-encodes every chunk in mini-batches and upserts one row per chunk
+  into LanceDB, then automatically removes the temporary chunk JSON files after successful
+  insertion.
 - **`store.py`** — LanceDB access: the chunk table schema, idempotent upsert by `chunk_id`,
   vector search (the RAG entry point), and Parquet export.
 - **`report.py`** — QC statistics over the registry (counts per status, source, query

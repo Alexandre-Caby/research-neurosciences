@@ -1,3 +1,4 @@
+import gc
 import os
 import argparse
 from statistics import median
@@ -45,7 +46,7 @@ def extract_with_fitz(pdf_path):
         blocks_out = []
 
         for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:  # 0 = text block, 1 = image
+            if block.get("type") != 0:
                 continue
             lines = block.get("lines", [])
             if not lines:
@@ -86,7 +87,6 @@ def extract_with_fitz(pdf_path):
         threshold = max(2, int(total_pages * 0.4))
         boilerplate = {t for t, c in text_counts.items() if c >= threshold}
 
-    # Body font size = median block size across the whole document.
     all_sizes = [b["size"] for page in pages_blocks for b in page if b["size"] > 0]
     body_size = median(all_sizes) if all_sizes else 10.0
 
@@ -193,7 +193,7 @@ def build_front_matter(meta, engine, quality):
 
 
 def _fitz_only(pdf_path):
-    """Top-level, picklable: fitz extraction + quality only, for worker processes."""
+    """Worker process isolation."""
     try:
         text = extract_with_fitz(pdf_path)
     except Exception as e:
@@ -205,60 +205,69 @@ def _fitz_only(pdf_path):
 def run_extract(limit=None, workers=None):
     conn = R.connect(config.DB_PATH)
     papers = [p for p in R.get_by_status(conn, R.FETCHED) if p["raw_path"] and os.path.exists(p["raw_path"])]
+    
     if limit:
         papers = papers[:limit]
-
     if not papers:
         logger.info("No fetched PDFs to extract.")
         return
 
-    fitz_results = {}
+    logger.info("CAD/Doc Extractor: Extracting %d paper(s)...", len(papers))
+
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_fitz_only, p["raw_path"]): p["paper_id"] for p in papers}
+        futures = {executor.submit(_fitz_only, p["raw_path"]): p for p in papers}
+
         for future in as_completed(futures):
-            paper_id = futures[future]
+            paper = futures[future]
+            paper_id = paper["paper_id"]
+
             try:
-                fitz_results[paper_id] = future.result()
+                fitz_text, fitz_score, reason = future.result()
             except Exception as e:
-                fitz_results[paper_id] = ("", 0.0, f"worker_error:{e}")
+                fitz_text, fitz_score, reason = "", 0.0, f"worker_error:{e}"
 
-    for paper in papers:
-        paper_id = paper["paper_id"]
-        fitz_text, fitz_score, reason = fitz_results[paper_id]
+            markdown, engine, quality = fitz_text, "fitz", fitz_score
 
-        markdown, engine, quality = fitz_text, "fitz", fitz_score
-        if fitz_score < config.QUALITY_THRESHOLD:
-            logger.info("Fitz quality insufficient for %s (%s, score=%.2f).", paper_id, reason, fitz_score)
-            converter, text_from_rendered = get_marker()
-            if converter is not None:
-                try:
-                    rendered = converter(paper["raw_path"])
-                    marker_text, _, _ = text_from_rendered(rendered)
-                    marker_score, _ = assess_quality(marker_text)
-                    if marker_score > fitz_score:
-                        markdown, engine, quality = marker_text, "marker", marker_score
-                except Exception as e:
-                    logger.warning("Marker crashed on %s: %s", paper_id, e)
+            if fitz_score < config.QUALITY_THRESHOLD:
+                logger.info("Fitz quality insufficient for %s (%s, score=%.2f). Escalating to Marker...", paper_id, reason, fitz_score)
+                converter, text_from_rendered = get_marker()
+                if converter is not None:
+                    try:
+                        rendered = converter(paper["raw_path"])
+                        marker_text, _, _ = text_from_rendered(rendered)
+                        marker_score, _ = assess_quality(marker_text)
+                        if marker_score > fitz_score:
+                            markdown, engine, quality = marker_text, "marker", marker_score
+                    except Exception as e:
+                        logger.warning("Marker crashed on %s: %s", paper_id, e)
+                    finally:
+                        gc.collect()
+                        if has_torch and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-        if len(markdown.strip()) > 300:
-            content_hash = R.content_hash(markdown)
-            dup_id = R.hash_seen(conn, content_hash)
-            if dup_id and dup_id != paper_id:
-                R.update_status(conn, paper_id, R.DUPLICATE, content_hash=content_hash)
-                logger.info("Duplicate content (matches %s): %s", dup_id, paper_id)
+            if len(markdown.strip()) > 300:
+                content_hash = R.content_hash(markdown)
+                dup_id = R.hash_seen(conn, content_hash)
+                
+                if dup_id and dup_id != paper_id:
+                    R.update_status(conn, paper_id, R.DUPLICATE, content_hash=content_hash)
+                    logger.info("Duplicate content (matches %s): %s", dup_id, paper_id)
+                else:
+                    md_path = os.path.join(config.EXP_DIR, f"{paper_id}.md")
+                    front_matter = build_front_matter(dict(paper), engine, quality)
+                    
+                    with open(md_path, "w", encoding="utf-8") as f:
+                        f.write(front_matter + markdown)
+                        
+                    R.update_status(
+                        conn, paper_id, R.EXTRACTED,
+                        md_path=md_path, extraction_engine=engine,
+                        extraction_quality=round(quality, 2), content_hash=content_hash
+                    )
+                    logger.info("Extracted (%s, q=%.2f): %s", engine, quality, paper_id)
             else:
-                md_path = os.path.join(config.EXP_DIR, f"{paper_id}.md")
-                front_matter = build_front_matter(dict(paper), engine, quality)
-                with open(md_path, "w", encoding="utf-8") as f:
-                    f.write(front_matter + markdown)
-                R.update_status(conn, paper_id, R.EXTRACTED, md_path=md_path,
-                                 extraction_engine=engine, extraction_quality=round(quality, 2),
-                                 content_hash=content_hash)
-                logger.info("Extracted (%s, q=%.2f): %s", engine, quality, paper_id)
-        else:
-            R.update_status(conn, paper_id, R.FAILED, extraction_engine=engine,
-                             extraction_quality=round(quality, 2))
-            logger.info("Extraction failed: %s", paper_id)
+                R.update_status(conn, paper_id, R.FAILED, extraction_engine=engine, extraction_quality=round(quality, 2))
+                logger.info("Extraction failed: %s", paper_id)
 
 
 if __name__ == "__main__":

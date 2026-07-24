@@ -1,4 +1,5 @@
 """SQLite control plane: paper lifecycle state shared by every source/worker."""
+
 import hashlib
 import json
 import re
@@ -97,6 +98,27 @@ def canonical_doi(doi) -> str | None:
     return s or None
 
 
+def get_known_identifiers(conn) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Collect known DOIs, titles, and statuses from the database for duplicate detection."""
+    rows = conn.execute("SELECT paper_id, doi, title, status FROM papers").fetchall()
+    known_dois = {}
+    known_titles = {}
+    known_statuses = {}
+
+    for r in rows:
+        pid = r["paper_id"]
+        known_statuses[pid] = r["status"]
+        c_doi = canonical_doi(r["doi"])
+        if c_doi:
+            known_dois[c_doi] = pid
+        if r["title"]:
+            norm_t = normalize_title(r["title"])
+            if norm_t:
+                known_titles[norm_t] = pid
+
+    return known_dois, known_titles, known_statuses
+
+
 def upsert_paper(
     conn, paper_id, *, openalex_id=None, doi=None, title=None, year=None,
     abstract=None, source=None, query_block=None, landing_url=None,
@@ -152,30 +174,9 @@ def hash_seen(conn, content_hash) -> str | None:
     return row["paper_id"] if row else None
 
 
-def doi_seen(conn, doi) -> str | None:
-    canon = canonical_doi(doi)
-    if not canon:
-        return None
-    # Canonicalize the stored side too: sources persist DOIs in mixed url/bare form.
-    row = conn.execute(
-        "SELECT paper_id FROM papers WHERE canonical_doi(doi) = ?", (canon,)
-    ).fetchone()
-    return row["paper_id"] if row else None
-
-
 def get_status(conn, paper_id) -> str | None:
     row = conn.execute("SELECT status FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
     return row["status"] if row else None
-
-
-def title_seen(conn, title) -> str | None:
-    if not title:
-        return None
-    target = normalize_title(title)
-    for row in conn.execute("SELECT paper_id, title FROM papers WHERE title IS NOT NULL"):
-        if normalize_title(row["title"]) == target:
-            return row["paper_id"]
-    return None
 
 
 def get_cursor(conn, source, block, default=None) -> dict:

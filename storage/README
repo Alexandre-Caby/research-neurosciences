@@ -21,3 +21,7 @@ their processing maturity.
   and the LanceDB table that holds one embedded row per chunk (vector + metadata). This tier
   serves both the semantic-search / RAG index and a versioned training-dataset export to
   Parquet.
+
+  **Note on JSON files**: The chunk JSON files generated during the chunking phase are
+  temporary. They are automatically deleted as soon as they have been successfully inserted
+  into LanceDB to avoid inode-table pressure and disk-space saturation.
