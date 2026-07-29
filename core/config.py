@@ -12,8 +12,15 @@ VECTOR_DIR = os.path.join(STORAGE_DIR, "4_vector_data")
 DB_PATH = os.path.join(REGISTRY_DIR, f"{TOPIC}_registry.db")
 LANCE_DIR = os.path.join(VECTOR_DIR, "lance")
 
+def ensure_storage_dirs() -> None:
+    for path in (STORAGE_DIR, RAW_DIR, REGISTRY_DIR, EXP_DIR, VECTOR_DIR, LANCE_DIR):
+        os.makedirs(path, exist_ok=True)
+
+ensure_storage_dirs()
+
 EMAIL_CONTACT = os.environ.get("NEURO_CONTACT_EMAIL", "research@example.org")
 CORE_API_KEY = os.environ.get("CORE_API_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 TEXT_MODEL = "BAAI/bge-m3"
 TEXT_DIM = 1024

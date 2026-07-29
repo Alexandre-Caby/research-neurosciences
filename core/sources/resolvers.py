@@ -1,4 +1,4 @@
-"""Shared PDF/HTML candidate cascade, ported from v1 core/ingest.py."""
+"""Shared PDF/HTML candidate cascade, ported from core/ingest.py."""
 import re
 import time
 
@@ -33,6 +33,9 @@ def request_with_retry(url, params=None, headers=None, timeout=REQUEST_TIMEOUT):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return requests.get(url, params=params, headers=headers or HEADERS, timeout=timeout)
+        except requests.exceptions.ProxyError as e:
+            logger.warning("Proxy error on %s (%s). Skipping retries.", url[:70], e)
+            return None
         except requests.RequestException as e:
             last_exc = e
             wait = RETRY_BACKOFF ** attempt

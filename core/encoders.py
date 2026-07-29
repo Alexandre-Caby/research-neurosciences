@@ -1,6 +1,11 @@
+import os
+
 import numpy as np
 
 from core import config
+from core.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class TextEncoder:
@@ -16,9 +21,22 @@ class TextEncoder:
 
     def _load(self):
         if self._model is None:
+            if not (os.environ.get("HF_HOME") or os.environ.get("SENTENCE_TRANSFORMERS_HOME")):
+                logger.warning(
+                    "No HF_HOME/SENTENCE_TRANSFORMERS_HOME set: %s will re-download "
+                    "on every run instead of using a persistent cache.", self.model_name,
+                )
+            if not config.HF_TOKEN:
+                logger.warning(
+                    "No HF_TOKEN set: downloads are rate-limited as an anonymous request."
+                )
+
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+            self._model = SentenceTransformer(
+                self.model_name, device=self.device,
+                token=config.HF_TOKEN or None,
+            )
             self._dim = self._model.get_sentence_embedding_dimension()
 
     def encode(self, texts: list[str], batch_size=config.EMBED_BATCH) -> np.ndarray:

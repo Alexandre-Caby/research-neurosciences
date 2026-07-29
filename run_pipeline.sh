@@ -3,13 +3,16 @@ set -euo pipefail
 
 source ~/.venv/bin/activate
 
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
 SOURCE=""
 LIMIT=""
 WORKERS=""
 PURGE=false
 YES=false
 
-while [[ $# -gt 0 ]]; do
+while [[ $# -gt 0 ]]; 
+do
     case "$1" in
         --source) SOURCE="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
@@ -57,3 +60,21 @@ if [[ "$PURGE" == true ]]; then
     banner "purge"
     python -m core.purge "${purge_args[@]}"
 fi
+
+banner "pipeline completed, cleaning up run artifacts"
+find . -type d -name "__pycache__" -exec rm -rf {} +
+
+echo "--------------------------------------------------"
+echo "Pipeline completed successfully."
+echo "Metrics:"
+python -c "
+from core import config
+from core import registry as R
+from core.report import run_report
+conn = R.connect(config.DB_PATH)
+report = run_report(conn)
+print(f'- Total papers:   {report[\"total\"]}')
+print(f'- By status:      {report[\"by_status\"]}')
+print(f'- Chunks total:   {report[\"num_chunks_total\"]}')
+"
+echo "--------------------------------------------------"

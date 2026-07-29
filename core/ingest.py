@@ -1,6 +1,7 @@
 """Ingestion orchestrator: discover (multi-source) -> dedup -> resolve -> fetch -> register."""
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import html2text
 import requests
@@ -14,6 +15,8 @@ from core.sources import crossref, europepmc, openalex, resolvers
 logger = get_logger(__name__)
 
 SOURCES = {"openalex": openalex, "europepmc": europepmc, "crossref": crossref}
+
+INGEST_WORKERS = int(os.environ.get("INGEST_WORKERS", "8"))
 
 REQUEST_TIMEOUT = 20
 HEADERS = {
@@ -69,7 +72,6 @@ def scrape_html_to_md(url, dest_stub):
 
 
 def _default_cursor(source_name):
-    # europepmc paginates by opaque cursorMark, not a page number; "*" is its start token.
     if source_name == "europepmc":
         return {"cursor": "*", "next_page": 1}
     return {"next_page": 1}
@@ -99,19 +101,23 @@ def _try_fetch(candidates, dest_stub):
     return None, None, None
 
 
-def _retry_paywalled(conn, existing_id, record):
-    """A later source may carry a direct OA candidate the first source lacked."""
+def _resolve_and_fetch_task(paper_id, record):
+    """Runs in a worker thread: network-only, touches no DB connection."""
     candidates = resolvers.resolve(record)
-    if not candidates:
-        return
-    kind, path, used = _try_fetch(candidates, existing_id)
+    kind, path, used = _try_fetch(candidates, paper_id)
+    return paper_id, kind, path, used
+
+
+def _apply_fetch_result(conn, paper_id, kind, path, used):
     if kind == "pdf":
-        R.update_status(conn, existing_id, R.FETCHED, raw_path=path, source_used=used)
+        R.update_status(conn, paper_id, R.FETCHED, raw_path=path, source_used=used)
     elif kind == "html":
         R.update_status(
-            conn, existing_id, R.EXTRACTED,
+            conn, paper_id, R.EXTRACTED,
             md_path=path, extraction_engine="html", source_used=used,
         )
+    else:
+        R.update_status(conn, paper_id, R.PAYWALLED)
 
 
 def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_page=25):
@@ -136,51 +142,55 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
             records, next_cursor = module.discover(block, query, cursor, per_page)
 
             page_consumed = True
-            for record in records:
-                if limit is not None and registered >= limit:
-                    page_consumed = False
-                    break
+            with ThreadPoolExecutor(max_workers=INGEST_WORKERS) as executor:
+                futures = {}
 
-                doi = R.canonical_doi(record.get("doi"))
-                title = record.get("title")
-                norm_title = R.normalize_title(title) if title else None
+                for record in records:
+                    if limit is not None and registered >= limit:
+                        page_consumed = False
+                        break
 
-                existing_id = (doi and known_dois.get(doi)) or (norm_title and known_titles.get(norm_title))
-                if existing_id:
-                    if R.get_status(conn, existing_id) == R.PAYWALLED:
-                        _retry_paywalled(conn, existing_id, record)
-                    continue
+                    doi = R.canonical_doi(record.get("doi"))
+                    title = record.get("title")
+                    norm_title = R.normalize_title(title) if title else None
 
-                paper_id = _paper_id(source_name, record, doi)
-                if paper_id is None:
-                    logger.warning("Skipping record with no doi/openalex_id/content: %r", record.get("title"))
-                    continue
+                    existing_id = (doi and known_dois.get(doi)) or (norm_title and known_titles.get(norm_title))
+                    if existing_id:
+                        if R.get_status(conn, existing_id) == R.PAYWALLED:
+                            fut = executor.submit(_resolve_and_fetch_task, existing_id, record)
+                            futures[fut] = existing_id
+                        continue
 
-                R.upsert_paper(
-                    conn, paper_id,
-                    openalex_id=record.get("openalex_id"), doi=doi, title=title,
-                    year=record.get("year"), abstract=record.get("abstract"),
-                    source=source_name, query_block=block,
-                    landing_url=record.get("landing_url"), status=R.DISCOVERED,
-                )
-                registered += 1
+                    paper_id = _paper_id(source_name, record, doi)
+                    if paper_id is None:
+                        logger.warning("Skipping record with no doi/openalex_id/content: %r", record.get("title"))
+                        continue
 
-                if doi:
-                    known_dois[doi] = paper_id
-                if norm_title:
-                    known_titles[norm_title] = paper_id
-
-                candidates = resolvers.resolve(record)
-                kind, path, used = _try_fetch(candidates, paper_id)
-                if kind == "pdf":
-                    R.update_status(conn, paper_id, R.FETCHED, raw_path=path, source_used=used)
-                elif kind == "html":
-                    R.update_status(
-                        conn, paper_id, R.EXTRACTED,
-                        md_path=path, extraction_engine="html", source_used=used,
+                    R.upsert_paper(
+                        conn, paper_id,
+                        openalex_id=record.get("openalex_id"), doi=doi, title=title,
+                        year=record.get("year"), abstract=record.get("abstract"),
+                        source=source_name, query_block=block,
+                        landing_url=record.get("landing_url"), status=R.DISCOVERED,
                     )
-                else:
-                    R.update_status(conn, paper_id, R.PAYWALLED)
+                    registered += 1
+
+                    if doi:
+                        known_dois[doi] = paper_id
+                    if norm_title:
+                        known_titles[norm_title] = paper_id
+
+                    fut = executor.submit(_resolve_and_fetch_task, paper_id, record)
+                    futures[fut] = paper_id
+
+                for future in as_completed(futures):
+                    paper_id = futures[future]
+                    try:
+                        _, kind, path, used = future.result()
+                    except Exception as e:
+                        logger.warning("resolve/fetch crashed for %s: %s", paper_id, e)
+                        kind, path, used = None, None, None
+                    _apply_fetch_result(conn, paper_id, kind, path, used)
 
             if page_consumed:
                 R.save_cursor(conn, source_name, block, next_cursor)

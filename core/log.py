@@ -20,8 +20,6 @@ def get_logger(name: str) -> logging.Logger:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
-    os.makedirs(config.STORAGE_DIR, exist_ok=True)
     log_path = os.path.join(config.STORAGE_DIR, "pipeline.log")
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(formatter)

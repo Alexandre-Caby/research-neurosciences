@@ -43,7 +43,11 @@ def _row_to_lance(chunk, paper_row):
     }
 
 
-def run_embed(text_encoder=None, limit=None, batch_size=32, purge_chunks_json=True) -> None:
+MAX_CHUNKS_PER_BATCH = int(os.environ.get("EMBED_MAX_CHUNKS_PER_BATCH", "1500"))
+
+
+def run_embed(text_encoder=None, limit=None, batch_size=32, purge_chunks_json=True,
+              max_chunks_per_batch=MAX_CHUNKS_PER_BATCH) -> None:
     if text_encoder is None:
         from core.encoders import TextEncoder
         text_encoder = TextEncoder()
@@ -58,37 +62,20 @@ def run_embed(text_encoder=None, limit=None, batch_size=32, purge_chunks_json=Tr
         return
 
     store = LanceStore(lance_dir=config.LANCE_DIR)
-    logger.info("Embedding %d papers in mini-batches of %d...", len(papers), batch_size)
+    logger.info(
+        "Embedding %d papers, capped at %d chunks/batch (encoder internal batch_size=%d)...",
+        len(papers), max_chunks_per_batch, batch_size,
+    )
 
-    for i in range(0, len(papers), batch_size):
-        batch_papers = papers[i : i + batch_size]
-        batch_chunks = []
-        embedded_paper_ids = []
-        json_paths_to_purge = []
+    batch_chunks: list[dict] = []
+    embedded_paper_ids: list[str] = []
+    json_paths_to_purge: list[str] = []
 
-        for row in batch_papers:
-            paper_id, chunks_path = row["paper_id"], row["chunks_path"]
-            if not chunks_path or not os.path.exists(chunks_path):
-                R.update_status(conn, paper_id, R.EMPTY, error="chunks_path missing")
-                continue
-
-            with open(chunks_path, "r", encoding="utf-8") as f:
-                chunks = json.load(f)
-
-            if not chunks:
-                R.update_status(conn, paper_id, R.EMPTY, error="no chunks in file")
-                continue
-
-            for chunk in chunks:
-                batch_chunks.append(_row_to_lance(chunk, row))
-
-            embedded_paper_ids.append(paper_id)
-            json_paths_to_purge.append(chunks_path)
-
+    def flush():
+        nonlocal batch_chunks, embedded_paper_ids, json_paths_to_purge
         if not batch_chunks:
-            continue
-
-        vectors = text_encoder.encode([c["text"] for c in batch_chunks])
+            return
+        vectors = text_encoder.encode([c["text"] for c in batch_chunks], batch_size=batch_size)
         for chunk_row, vector in zip(batch_chunks, vectors):
             chunk_row["vector"] = vector
 
@@ -105,6 +92,35 @@ def run_embed(text_encoder=None, limit=None, batch_size=32, purge_chunks_json=Tr
                         os.remove(json_p)
                 except OSError as e:
                     logger.warning("Failed to purge chunk json %s: %s", json_p, e)
+
+        batch_chunks, embedded_paper_ids, json_paths_to_purge = [], [], []
+
+    for row in papers:
+        paper_id, chunks_path = row["paper_id"], row["chunks_path"]
+        if not chunks_path or not os.path.exists(chunks_path):
+            R.update_status(conn, paper_id, R.EMPTY, error="chunks_path missing")
+            continue
+
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+
+        if not chunks:
+            R.update_status(conn, paper_id, R.EMPTY, error="no chunks in file")
+            continue
+
+        if batch_chunks and len(batch_chunks) + len(chunks) > max_chunks_per_batch:
+            flush()
+
+        for chunk in chunks:
+            batch_chunks.append(_row_to_lance(chunk, row))
+
+        embedded_paper_ids.append(paper_id)
+        json_paths_to_purge.append(chunks_path)
+
+        if len(batch_chunks) >= max_chunks_per_batch:
+            flush()
+
+    flush()  # final partial batch
 
 
 if __name__ == "__main__":
