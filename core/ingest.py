@@ -29,6 +29,11 @@ _h2t = html2text.HTML2Text()
 _h2t.ignore_links = False
 
 
+class TransportError(Exception):
+    """Echec reseau (proxy indisponible, connexion refusee, timeout).
+    """
+
+
 def download_pdf(url, dest_stub):
     try:
         res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
@@ -41,9 +46,13 @@ def download_pdf(url, dest_stub):
             return path
         finally:
             res.close()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        logger.warning("Transport error (PDF) on %s: %s", url, e)
+        raise TransportError(str(e)) from e
     except requests.RequestException as e:
         logger.warning("Failed PDF fetch from %s: %s", url, e)
         return None
+
 
 def scrape_html_to_md(url, dest_stub):
     try:
@@ -66,6 +75,9 @@ def scrape_html_to_md(url, dest_stub):
             return path
         finally:
             res.close()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        logger.warning("Transport error (HTML) on %s: %s", url, e)
+        raise TransportError(str(e)) from e
     except requests.RequestException as e:
         logger.warning("Failed HTML scrape from %s: %s", url, e)
         return None
@@ -91,24 +103,35 @@ def _paper_id(source, record, doi):
 
 
 def _try_fetch(candidates, dest_stub):
+    """Retourne (kind, path, source_name, transport_failed).
+    """
+    transport_failed = False
     for name, url in candidates:
-        pdf_path = download_pdf(url, dest_stub)
-        if pdf_path:
-            return "pdf", pdf_path, name
-        md_path = scrape_html_to_md(url, dest_stub)
-        if md_path:
-            return "html", md_path, name
-    return None, None, None
+        try:
+            pdf_path = download_pdf(url, dest_stub)
+            if pdf_path:
+                return "pdf", pdf_path, name, False
+        except TransportError:
+            transport_failed = True
+
+        try:
+            md_path = scrape_html_to_md(url, dest_stub)
+            if md_path:
+                return "html", md_path, name, False
+        except TransportError:
+            transport_failed = True
+
+    return None, None, None, transport_failed
 
 
 def _resolve_and_fetch_task(paper_id, record):
     """Runs in a worker thread: network-only, touches no DB connection."""
     candidates = resolvers.resolve(record)
-    kind, path, used = _try_fetch(candidates, paper_id)
-    return paper_id, kind, path, used
+    kind, path, used, transport_failed = _try_fetch(candidates, paper_id)
+    return paper_id, kind, path, used, transport_failed
 
 
-def _apply_fetch_result(conn, paper_id, kind, path, used):
+def _apply_fetch_result(conn, paper_id, kind, path, used, transport_failed=False):
     if kind == "pdf":
         R.update_status(conn, paper_id, R.FETCHED, raw_path=path, source_used=used)
     elif kind == "html":
@@ -116,6 +139,8 @@ def _apply_fetch_result(conn, paper_id, kind, path, used):
             conn, paper_id, R.EXTRACTED,
             md_path=path, extraction_engine="html", source_used=used,
         )
+    elif transport_failed:
+        R.update_status(conn, paper_id, R.FAILED, error="transport")
     else:
         R.update_status(conn, paper_id, R.PAYWALLED)
 
@@ -126,7 +151,7 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
     known_dois, known_titles, known_statuses = R.get_known_identifiers(conn)
     logger.info("Ingest: %d DOIs and %d titles pre-loaded in memory for fast skip.",
                 len(known_dois), len(known_titles))
-    
+
     registered = 0
 
     for source_name in sources:
@@ -156,7 +181,7 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
 
                     existing_id = (doi and known_dois.get(doi)) or (norm_title and known_titles.get(norm_title))
                     if existing_id:
-                        if R.get_status(conn, existing_id) == R.PAYWALLED:
+                        if R.get_status(conn, existing_id) in (R.PAYWALLED, R.FAILED):
                             fut = executor.submit(_resolve_and_fetch_task, existing_id, record)
                             futures[fut] = existing_id
                         continue
@@ -185,12 +210,14 @@ def run_ingest(sources=("openalex", "europepmc", "crossref"), limit=None, per_pa
 
                 for future in as_completed(futures):
                     paper_id = futures[future]
+                    transport_failed = False
                     try:
-                        _, kind, path, used = future.result()
+                        _, kind, path, used, transport_failed = future.result()
                     except Exception as e:
                         logger.warning("resolve/fetch crashed for %s: %s", paper_id, e)
                         kind, path, used = None, None, None
-                    _apply_fetch_result(conn, paper_id, kind, path, used)
+                        transport_failed = True
+                    _apply_fetch_result(conn, paper_id, kind, path, used, transport_failed)
 
             if page_consumed:
                 R.save_cursor(conn, source_name, block, next_cursor)
